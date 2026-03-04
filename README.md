@@ -41,14 +41,14 @@ streamlit run app.py
 ## 4. 大模型配置
 
 页面侧边栏支持配置：
+- LLM URL（默认：`https://llmops-new.haid.com.cn/v1/chat-messages`，也支持环境变量 `LLM_URL`）
 - API Key（也支持环境变量 `LLM_API_KEY`）
-- User Tag（默认：`人工智能部-HR项目`）
+- User Tag（默认：`人工智能部-HR项目`，也支持环境变量 `LLM_USER_TAG`）
 - 超时秒数（默认 90）
 - 重试次数（默认 1）
 
-调用接口固定为：
-- URL: `https://llmops-new.haid.com.cn/v1/chat-messages`
-- 请求头：
+请求结构如下：
+- Header：
   - `Authorization: Bearer <api_key>`
   - `Content-Type: application/json`
 - Body：
@@ -58,6 +58,13 @@ streamlit run app.py
   - `conversation_id: <id>`
   - `user: <user_tag>`
 
-## 5. 注意
+## 5. 接口调试建议
+
+如果出现调用失败（如 404/405），请重点确认：
+1. 侧边栏的 `LLM URL` 必须是完整可直接 POST 的地址（建议直接填 `https://llmops-new.haid.com.cn/v1/chat-messages`）。
+2. API Key 是否正确且具备调用权限。
+3. 报错里会包含 `http_status` 与响应体片段，可用于定位网关路由或权限问题。
+
+## 6. 注意
 
 当前为“效果验证阶段”，直接读取 Excel 作为 prompt 上下文来源。

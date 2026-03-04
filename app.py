@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -8,6 +9,7 @@ import requests
 import streamlit as st
 
 EXCEL_DEFAULT = "岗位群画像列表_2026年02月06日18时32分.xlsx"
+DEFAULT_LLM_URL = "https://llmops-new.haid.com.cn/v1/chat-messages"
 REQUIRED_COLUMNS = [
     "岗位群名称",
     "职群",
@@ -27,7 +29,7 @@ REQUIRED_COLUMNS = [
 
 @dataclass
 class LLMConfig:
-    url: str = "https://llmops-new.haid.com.cn/v1/chat-messages"
+    url: str = DEFAULT_LLM_URL
     api_key: str = ""
     user_tag: str = "人工智能部-HR项目"
     timeout_sec: int = 90
@@ -35,8 +37,11 @@ class LLMConfig:
 
 
 class LLMClient:
+    """封装内部大模型调用：POST /v1/chat-messages"""
+
     def __init__(self, config: LLMConfig):
         self.config = config
+        self._session = requests.Session()
 
     def polish(self, prompt: str, conversation_id: Optional[str] = None) -> Tuple[str, str]:
         if not self.config.api_key:
@@ -54,30 +59,59 @@ class LLMClient:
             "user": self.config.user_tag,
         }
 
-        retries = 0
-        last_err = None
-        while retries <= self.config.max_retries:
+        last_error = ""
+        for attempt in range(int(self.config.max_retries) + 1):
+            start = time.monotonic()
             try:
-                resp = requests.post(
+                resp = self._session.post(
                     self.config.url,
                     headers=headers,
                     json=payload,
-                    timeout=self.config.timeout_sec,
+                    timeout=int(self.config.timeout_sec),
                 )
-                resp.raise_for_status()
-                data = resp.json()
-                answer = self._extract_answer(data)
+                latency_ms = int((time.monotonic() - start) * 1000)
+
+                if resp.status_code != 200:
+                    last_error = (
+                        f"http_status={resp.status_code}, latency_ms={latency_ms}, "
+                        f"url={self.config.url}, resp={self._safe_text(resp)}"
+                    )
+                    continue
+
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    raise RuntimeError(
+                        f"响应解析失败: json parse fail: {e}; url={self.config.url}; "
+                        f"latency_ms={latency_ms}; resp={self._safe_text(resp)}"
+                    )
+
+                answer = (data.get("answer") or "").strip()
+                if not answer:
+                    answer = self._extract_answer(data).strip()
+
+                if not answer:
+                    raise RuntimeError(
+                        f"响应为空: url={self.config.url}; latency_ms={latency_ms}; raw={str(data)[:500]}"
+                    )
+
                 next_conversation_id = data.get("conversation_id", conversation_id or "")
                 return answer, next_conversation_id
-            except Exception as e:
-                last_err = e
-                retries += 1
+            except requests.RequestException as e:
+                latency_ms = int((time.monotonic() - start) * 1000)
+                last_error = (
+                    f"request_exception={type(e).__name__}: {e}; "
+                    f"url={self.config.url}; latency_ms={latency_ms}"
+                )
 
-        raise RuntimeError(f"调用大模型失败: {last_err}")
+        raise RuntimeError(f"调用大模型失败: {last_error or 'unknown error'}")
+
+    @staticmethod
+    def _safe_text(resp: requests.Response, limit: int = 500) -> str:
+        return (resp.text or "").strip().replace("\n", " ")[:limit]
 
     @staticmethod
     def _extract_answer(data: Dict[str, Any]) -> str:
-        # 兼容常见返回格式
         if "answer" in data and isinstance(data["answer"], str):
             return data["answer"]
         if "data" in data and isinstance(data["data"], dict):
@@ -86,7 +120,7 @@ class LLMClient:
                 return inner["answer"]
         if "output" in data and isinstance(data["output"], str):
             return data["output"]
-        return str(data)
+        return ""
 
 
 @st.cache_data(show_spinner=False)
@@ -138,13 +172,14 @@ def main() -> None:
     with st.sidebar:
         st.subheader("配置")
         excel_path = st.text_input("Excel 文件路径", value=EXCEL_DEFAULT)
+        llm_url = st.text_input("LLM URL", value=os.getenv("LLM_URL", DEFAULT_LLM_URL))
         api_key = st.text_input(
             "API Key",
             value=os.getenv("LLM_API_KEY", ""),
             type="password",
             help="优先读取这里填写的值，未填写时可使用环境变量 LLM_API_KEY。",
         )
-        user_tag = st.text_input("User Tag", value="人工智能部-HR项目")
+        user_tag = st.text_input("User Tag", value=os.getenv("LLM_USER_TAG", "人工智能部-HR项目"))
         timeout_sec = st.number_input("超时时间（秒）", min_value=5, max_value=300, value=90)
         max_retries = st.number_input("重试次数", min_value=0, max_value=5, value=1)
 
@@ -167,21 +202,22 @@ def main() -> None:
         st.stop()
 
     selected_post = st.selectbox("请选择岗位名称（关联岗位名称）", posts)
-    selected_rows = df[df["关联岗位名称"] == selected_post]
-    selected_row = selected_rows.iloc[0]
+    selected_row = df[df["关联岗位名称"] == selected_post].iloc[0]
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### 岗位背景信息")
-        st.json({
-            "岗位群名称": selected_row["岗位群名称"],
-            "职群": selected_row["职群"],
-            "岗位群职级范围": selected_row["岗位群职级范围"],
-            "岗位层级": selected_row["岗位层级"],
-            "定位": selected_row["定位"],
-            "核心职责": selected_row["核心职责"],
-            "关键业务活动": selected_row["关键业务活动"],
-        })
+        st.json(
+            {
+                "岗位群名称": selected_row["岗位群名称"],
+                "职群": selected_row["职群"],
+                "岗位群职级范围": selected_row["岗位群职级范围"],
+                "岗位层级": selected_row["岗位层级"],
+                "定位": selected_row["定位"],
+                "核心职责": selected_row["核心职责"],
+                "关键业务活动": selected_row["关键业务活动"],
+            }
+        )
 
     with c2:
         st.markdown("### 输入专业指标描述")
@@ -198,6 +234,7 @@ def main() -> None:
                 prompt = build_prompt(selected_row, user_input.strip())
                 client = LLMClient(
                     LLMConfig(
+                        url=llm_url,
                         api_key=api_key,
                         user_tag=user_tag,
                         timeout_sec=int(timeout_sec),
@@ -222,6 +259,7 @@ def main() -> None:
                         )
                     except Exception as e:
                         st.error(f"生成失败：{e}")
+                        st.info("请确认 URL 必须是可直接 POST 的完整地址（例如 .../v1/chat-messages）。")
 
 
 if __name__ == "__main__":
